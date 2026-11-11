@@ -47,7 +47,7 @@ def generate_key(req: GenReq, x_admin_password: str = Header(None)):
     
     key = new_key()
     now = datetime.now(timezone.utc)
-    exp = (now + timedelta(days=req.days)).isoformat() if req.days else None
+    exp = None # Expiry is calculated on first login
     
     c = sqlite3.connect(DB)
     c.execute("INSERT INTO licenses VALUES (?,?,?,?,?,?)",
