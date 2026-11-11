@@ -23,10 +23,27 @@ def hash_key(k):
 
 def init_db():
     con = sqlite3.connect(DB)
+    # Added "days" column to remember how long the sub is supposed to last
     con.execute("""CREATE TABLE IF NOT EXISTS licenses(
-        key_hash TEXT PRIMARY KEY, email TEXT, created_at TEXT,
-        expires_at TEXT, revoked INTEGER DEFAULT 0, last_device TEXT)""")
+        key_hash TEXT PRIMARY KEY, 
+        email TEXT, 
+        created_at TEXT,
+        expires_at TEXT, 
+        revoked INTEGER DEFAULT 0, 
+        last_device TEXT,
+        days INTEGER
+    )""")
     con.commit(); con.close()
+
+# Delete the old database if the columns changed so it updates cleanly
+if os.path.exists(DB):
+    try:
+        con = sqlite3.connect(DB)
+        con.execute("SELECT days FROM licenses LIMIT 1")
+        con.close()
+    except sqlite3.OperationalError:
+        os.remove(DB) # Deletes old DB to prevent errors
+
 init_db()
 
 class AuthReq(BaseModel):
@@ -47,32 +64,45 @@ def generate_key(req: GenReq, x_admin_password: str = Header(None)):
     
     key = new_key()
     now = datetime.now(timezone.utc)
-    exp = None # Expiry is calculated on first login
     
+    # When generating, expires_at is None. It starts counting on first login!
     c = sqlite3.connect(DB)
-    c.execute("INSERT INTO licenses VALUES (?,?,?,?,?,?)",
-              (hash_key(key), req.email, now.isoformat(), exp, 0, None))
+    c.execute("INSERT INTO licenses (key_hash, email, created_at, expires_at, revoked, last_device, days) VALUES (?,?,?,?,?,?,?)",
+              (hash_key(key), req.email, now.isoformat(), None, 0, None, req.days))
     c.commit(); c.close()
     
-    return {"key": key, "expires_at": exp, "email": req.email}
+    return {"key": key, "days": req.days, "email": req.email}
 
 @app.post("/auth")
 def auth(req: AuthReq):
     c = sqlite3.connect(DB)
-    row = c.execute("SELECT email, expires_at, revoked, last_device FROM licenses WHERE key_hash=?",
+    row = c.execute("SELECT email, expires_at, revoked, last_device, days FROM licenses WHERE key_hash=?",
                     (hash_key(req.key.strip().upper()),)).fetchone()
     if not row:
         c.close(); raise HTTPException(401, "invalid key")
-    email, exp, revoked, last_device = row
+        
+    email, exp, revoked, last_device, days = row
+    
     if revoked:
         c.close(); raise HTTPException(403, "revoked")
+        
+    # If they have already logged in before, check the date
     if exp and datetime.fromisoformat(exp) < datetime.now(timezone.utc):
         c.close(); raise HTTPException(403, "expired")
+        
+    # If this is their very first time logging in
     if last_device is None:
-        c.execute("UPDATE licenses SET last_device=? WHERE key_hash=?",
-                  (req.device_id, hash_key(req.key.strip().upper())))
+        new_exp = None
+        # If the key has a time limit, start the clock NOW
+        if days is not None:
+            new_exp = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+            
+        c.execute("UPDATE licenses SET last_device=?, expires_at=? WHERE key_hash=?",
+                  (req.device_id, new_exp, hash_key(req.key.strip().upper())))
+        exp = new_exp
     elif last_device != req.device_id:
         c.close(); raise HTTPException(403, "key bound to another device")
+        
     c.commit(); c.close()
 
     access = jwt.encode({"email": email, "typ": "access",
@@ -81,7 +111,9 @@ def auth(req: AuthReq):
     refresh = jwt.encode({"email": email, "typ": "refresh",
                           "exp": datetime.now(timezone.utc) + timedelta(days=30)},
                          JWT_SECRET, algorithm="HS256")
-    return {"token": access, "refresh_token": refresh, "expires_at": exp}
+                         
+    # Fallback to "Lifetime" if no expiry
+    return {"token": access, "refresh_token": refresh, "expires_at": exp if exp else "Lifetime"}
 
 @app.post("/refresh")
 def refresh(req: RefreshReq):
