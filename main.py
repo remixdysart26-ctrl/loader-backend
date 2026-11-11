@@ -23,7 +23,7 @@ def hash_key(k):
 
 def init_db():
     con = sqlite3.connect(DB)
-    # Added "days" column to remember how long the sub is supposed to last
+    # Added "days" to remember how long the key should last
     con.execute("""CREATE TABLE IF NOT EXISTS licenses(
         key_hash TEXT PRIMARY KEY, 
         email TEXT, 
@@ -35,14 +35,14 @@ def init_db():
     )""")
     con.commit(); con.close()
 
-# Delete the old database if the columns changed so it updates cleanly
+# If you have an old database from previous tests, this deletes it so it updates cleanly
 if os.path.exists(DB):
     try:
         con = sqlite3.connect(DB)
         con.execute("SELECT days FROM licenses LIMIT 1")
         con.close()
     except sqlite3.OperationalError:
-        os.remove(DB) # Deletes old DB to prevent errors
+        os.remove(DB)
 
 init_db()
 
@@ -65,8 +65,8 @@ def generate_key(req: GenReq, x_admin_password: str = Header(None)):
     key = new_key()
     now = datetime.now(timezone.utc)
     
-    # When generating, expires_at is None. It starts counting on first login!
     c = sqlite3.connect(DB)
+    # expires_at is None when generated!
     c.execute("INSERT INTO licenses (key_hash, email, created_at, expires_at, revoked, last_device, days) VALUES (?,?,?,?,?,?,?)",
               (hash_key(key), req.email, now.isoformat(), None, 0, None, req.days))
     c.commit(); c.close()
@@ -86,14 +86,13 @@ def auth(req: AuthReq):
     if revoked:
         c.close(); raise HTTPException(403, "revoked")
         
-    # If they have already logged in before, check the date
+    # Check if expired (only applies if they have logged in before)
     if exp and datetime.fromisoformat(exp) < datetime.now(timezone.utc):
         c.close(); raise HTTPException(403, "expired")
         
-    # If this is their very first time logging in
+    # THIS IS THE MAGIC: First time they log in, start the timer
     if last_device is None:
         new_exp = None
-        # If the key has a time limit, start the clock NOW
         if days is not None:
             new_exp = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
             
@@ -112,7 +111,6 @@ def auth(req: AuthReq):
                           "exp": datetime.now(timezone.utc) + timedelta(days=30)},
                          JWT_SECRET, algorithm="HS256")
                          
-    # Fallback to "Lifetime" if no expiry
     return {"token": access, "refresh_token": refresh, "expires_at": exp if exp else "Lifetime"}
 
 @app.post("/refresh")
